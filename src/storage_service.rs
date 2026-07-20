@@ -186,6 +186,20 @@ impl StorageService {
         keys: Vec<Vec<u8>>,
         record_ikm: Option<&[u8]>,
     ) -> Result<Vec<StorageRecord>, StorageServiceError> {
+        Ok(self
+            .read_items_with_keys(keys, record_ikm)
+            .await?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect())
+    }
+
+    /// Fetch and decrypt storage items while preserving each response key.
+    pub async fn read_items_with_keys(
+        &self,
+        keys: Vec<Vec<u8>>,
+        record_ikm: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, StorageRecord)>, StorageServiceError> {
         let body = ReadOperation { read_key: keys };
         let mut buf = Vec::with_capacity(body.encoded_len());
         body.encode(&mut buf).expect("infallible encode into Vec");
@@ -206,11 +220,7 @@ impl StorageService {
             .protobuf()
             .await?;
 
-        items
-            .items
-            .iter()
-            .map(|item| Self::decrypt_item(&self.storage_key, item, record_ikm))
-            .collect()
+        Self::decrypt_items_with_keys(&self.storage_key, items, record_ikm)
     }
 
     // -- crypto ------------------------------------------------------------
@@ -246,6 +256,22 @@ impl StorageService {
         let key = Self::item_key(storage_key, &item.key, record_ikm);
         let plaintext = decrypt(&key, &item.value)?;
         Ok(StorageRecord::decode(&*plaintext)?)
+    }
+
+    fn decrypt_items_with_keys(
+        storage_key: &StorageServiceKey,
+        items: StorageItems,
+        record_ikm: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, StorageRecord)>, StorageServiceError> {
+        items
+            .items
+            .into_iter()
+            .map(|item| {
+                let record =
+                    Self::decrypt_item(storage_key, &item, record_ikm)?;
+                Ok((item.key, record))
+            })
+            .collect()
     }
 
     /// Encrypt a [`StorageRecord`] into a [`StorageItem`] ready to PUT.
@@ -393,6 +419,38 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn keyed_items_preserve_response_order() {
+        let storage_key = StorageServiceKey { inner: [9u8; 32] };
+        let record = StorageRecord { record: None };
+        let first = StorageService::encrypt_item(
+            &storage_key,
+            vec![1; 16],
+            &record,
+            None,
+        );
+        let second = StorageService::encrypt_item(
+            &storage_key,
+            vec![2; 16],
+            &record,
+            None,
+        );
+
+        let keyed = StorageService::decrypt_items_with_keys(
+            &storage_key,
+            StorageItems {
+                items: vec![second, first],
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(keyed[0].0, vec![2; 16]);
+        assert_eq!(keyed[1].0, vec![1; 16]);
+        assert_eq!(keyed[0].1, record);
+        assert_eq!(keyed[1].1, record);
     }
 
     #[test]
