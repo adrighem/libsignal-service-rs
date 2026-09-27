@@ -5,6 +5,10 @@
 
 A Rust version of the [libsignal-service-java][lsj] library which implements the core functionality to communicate with [Signal][signal] servers. It is based on the official Rust version of [libsignal][lsg]
 
+## Fork notes
+
+This fork carries one change on top of upstream, not yet merged there: `storage_service.rs` preserves keys when reading items, needed by signal-purple. It lives as a normal commit on `main` (not a pinned rev), so it rebases cleanly with future upstream syncs.
+
 ## Usage
 
 Usage of this library is not as straight-forward as with any other Rust library as it only provides some primitives.
