@@ -170,15 +170,15 @@ where
                 };
                 tracing::warn!(
                     ?envelope,
-                    "Received a decryption error message: {}.",
-                    String::from_utf8_lossy(dme)
+                    len = dme.len(),
+                    "Received a decryption error message."
                 );
             }
 
+            // Filter out SyncMessages that don't come from our own ACI.
             if matches!(content, crate::proto::content::Content::SyncMessage(_))
-                && plaintext.metadata.sender.aci().map(Uuid::from)
-                    != Some(local_service.raw_uuid())
-                && local_service.kind() == ServiceIdKind::Aci
+                && (plaintext.metadata.sender.aci() != local_service.aci()
+                    || local_service.kind() == ServiceIdKind::Pni)
             {
                 tracing::warn!("Source is not ourself.");
                 return Ok(None);

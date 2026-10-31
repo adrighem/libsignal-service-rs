@@ -24,6 +24,7 @@ use crate::proto::{
 use crate::push_service::{self, ServiceError, SignalServiceResponse};
 
 pub mod account;
+pub mod calling;
 #[cfg(feature = "cdsi")]
 pub mod directory;
 pub mod keys;
@@ -230,8 +231,9 @@ impl SignalWebSocketProcess {
     }
 
     async fn run(mut self) -> Result<(), ServiceError> {
+        // A keepalive sent before the server registers our presence makes it close the socket.
         let mut ka_interval = tokio::time::interval_at(
-            Instant::now(),
+            Instant::now() + push_service::KEEPALIVE_TIMEOUT_SECONDS,
             push_service::KEEPALIVE_TIMEOUT_SECONDS,
         );
 
