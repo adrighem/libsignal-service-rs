@@ -681,8 +681,7 @@ where
                             "creating session with missing device {}",
                             missing_device_id
                         );
-                        let remote_address = recipient
-                            .to_protocol_address(*missing_device_id)?;
+                        let remote_address = get_preferred_protocol_address(&self.protocol_store, &recipient, *missing_device_id).await?;
                         let pre_key = self
                             .identified_ws
                             .get_pre_key(&recipient, *missing_device_id)
@@ -711,17 +710,41 @@ where
                 },
                 Err(ServiceError::StaleDevices(ref m)) => {
                     tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.stale_devices {
+                    for stale_device_id in &m.stale_devices {
                         tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
+                            "refreshing session with device {}",
+                            stale_device_id
                         );
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
+                        let remote_address = get_preferred_protocol_address(&self.protocol_store, &recipient, *stale_device_id).await?;
+                        if let Some(mut session) = self.protocol_store.load_session(&remote_address).await? {
+                            session.archive_current_state()?;
+                            self.protocol_store.store_session(&remote_address, &session).await?;
+                        }
+
+                        let pre_key = self
+                            .identified_ws
+                            .get_pre_key(&recipient, *stale_device_id)
                             .await?;
+
+                        process_prekey_bundle(
+                            &remote_address,
+                            &self
+                                .local_aci
+                                .to_protocol_address(self.device_id)
+                                .expect("valid device id"),
+                            &mut self.protocol_store.clone(),
+                            &mut self.protocol_store,
+                            &pre_key,
+                            SystemTime::now(),
+                            &mut rng,
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("failed to create session: {}", e);
+                            MessageSenderError::UntrustedIdentity {
+                                address: recipient,
+                            }
+                        })?;
                     }
                 },
                 Err(ServiceError::ProofRequiredError(ref p)) => {
@@ -1038,11 +1061,19 @@ where
 
         // establish a session with the recipient/device if necessary
         // no need to establish a session with ourselves (and our own current device)
-        if self
+        let has_usable_session = match self
             .protocol_store
             .load_session(&recipient_protocol_address)
             .await?
-            .is_none()
+        {
+            Some(record) => record.has_usable_sender_chain(
+                std::time::SystemTime::now(),
+                libsignal_protocol::SessionUsabilityRequirements::NotStale
+                    | libsignal_protocol::SessionUsabilityRequirements::EstablishedWithPqxdh,
+            ).unwrap_or(false),
+            None => false,
+        };
+        if !has_usable_session
         {
             info!(
                 "establishing new session with {}",
