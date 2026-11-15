@@ -14,6 +14,12 @@ use crate::{
     websocket::{self, SignalRequestStream, SignalWebSocket},
 };
 
+/// An envelope response waiting to be sent once the next envelope is polled.
+type PendingAck = Option<(
+    oneshot::Sender<WebSocketResponseMessage>,
+    WebSocketResponseMessage,
+)>;
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Incoming {
@@ -45,10 +51,7 @@ impl MessagePipe {
             |(mut ws, mut stream_opt, mut pending_ack): (
                 SignalWebSocket<websocket::Identified>,
                 Option<SignalRequestStream>,
-                Option<(
-                    oneshot::Sender<WebSocketResponseMessage>,
-                    WebSocketResponseMessage,
-                )>,
+                PendingAck,
             )| async move {
                 let mut stream = match stream_opt.take() {
                     Some(s) => s,
@@ -150,13 +153,7 @@ mod tests {
 
         let mut pipe_stream = Box::pin(futures::stream::unfold(
             (rx, None),
-            |(mut stream, mut pending_ack): (
-                _,
-                Option<(
-                    oneshot::Sender<WebSocketResponseMessage>,
-                    WebSocketResponseMessage,
-                )>,
-            )| async move {
+            |(mut stream, mut pending_ack): (_, PendingAck)| async move {
                 if let Some((responder, response)) = pending_ack.take() {
                     responder.send(response).unwrap();
                 }
@@ -174,10 +171,7 @@ mod tests {
                         ));
                     } else if request.is_queue_empty() {
                         responder.send(response).unwrap();
-                        return Some((
-                            Incoming::QueueEmpty,
-                            (stream, None),
-                        ));
+                        return Some((Incoming::QueueEmpty, (stream, None)));
                     }
                 }
                 None
@@ -202,7 +196,7 @@ mod tests {
             headers: vec![],
             id: Some(2),
         };
-        let (ack_tx2, mut ack_rx2) = oneshot::channel();
+        let (ack_tx2, ack_rx2) = oneshot::channel();
         tx.send((req2, ack_tx2)).await.unwrap();
 
         // First poll yields Envelope(1), but must NOT have sent ack_rx1 yet!
