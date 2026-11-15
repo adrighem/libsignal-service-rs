@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use libsignal_protocol::{
     error::SignalProtocolError, kem, GenericSignedPreKey, IdentityKey,
     IdentityKeyPair, IdentityKeyStore, KeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyRecord, PreKeyStore,
+    KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore,
     SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
 
@@ -87,6 +87,31 @@ pub trait PreKeysStore:
     async fn last_resort_kyber_prekey_id(
         &self,
     ) -> Result<Option<KyberPreKeyId>, SignalProtocolError>;
+
+    /// Save many pre keys at once.
+    ///
+    /// Stores backed by a database should override this to write in a single
+    /// transaction.
+    async fn save_pre_keys(
+        &mut self,
+        records: &[(PreKeyId, PreKeyRecord)],
+    ) -> Result<(), SignalProtocolError> {
+        for (id, record) in records {
+            self.save_pre_key(*id, record).await?;
+        }
+        Ok(())
+    }
+
+    /// Save many Kyber pre keys at once. See [`Self::save_pre_keys`].
+    async fn save_kyber_pre_keys(
+        &mut self,
+        records: &[(KyberPreKeyId, KyberPreKeyRecord)],
+    ) -> Result<(), SignalProtocolError> {
+        for (id, record) in records {
+            self.save_kyber_pre_key(*id, record).await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -216,16 +241,19 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
         let pre_key_id =
             (((pre_keys_offset_id + i) % (PRE_KEY_MEDIUM_MAX_VALUE - 1)) + 1)
                 .into();
-        let pre_key_record = PreKeyRecord::new(pre_key_id, &key_pair);
-        protocol_store
-                    .save_pre_key(pre_key_id, &pre_key_record)
-                    .instrument(tracing::trace_span!(parent: &span, "save pre key", ?pre_key_id)).await?;
-        // TODO: Shouldn't this also remove the previous pre-keys from storage?
-        //       I think we might want to update the storage, and then sync the storage to the
-        //       server.
-
-        pre_keys.push(pre_key_record);
+        pre_keys.push(PreKeyRecord::new(pre_key_id, &key_pair));
     }
+    let records = pre_keys
+        .iter()
+        .map(|record| Ok((record.id()?, record.clone())))
+        .collect::<Result<Vec<_>, SignalProtocolError>>()?;
+    protocol_store
+        .save_pre_keys(&records)
+        .instrument(tracing::trace_span!(parent: &span, "save pre keys"))
+        .await?;
+    // TODO: Shouldn't this also remove the previous pre-keys from storage?
+    //       I think we might want to update the storage, and then sync the storage to the
+    //       server.
 
     // Kyber keys
     for i in 0..kyber_pre_key_count {
@@ -233,20 +261,23 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
             % (PRE_KEY_MEDIUM_MAX_VALUE - 1))
             + 1)
         .into();
-        let pre_key_record = KyberPreKeyRecord::generate(
+        pq_pre_keys.push(KyberPreKeyRecord::generate(
             kem::KeyType::Kyber1024,
             pre_key_id,
             identity_key_pair.private_key(),
-        )?;
-        protocol_store
-                    .save_kyber_pre_key(pre_key_id, &pre_key_record)
-                    .instrument(tracing::trace_span!(parent: &span, "save kyber pre key", ?pre_key_id)).await?;
-        // TODO: Shouldn't this also remove the previous pre-keys from storage?
-        //       I think we might want to update the storage, and then sync the storage to the
-        //       server.
-
-        pq_pre_keys.push(pre_key_record);
+        )?);
     }
+    let records = pq_pre_keys
+        .iter()
+        .map(|record| Ok((record.id()?, record.clone())))
+        .collect::<Result<Vec<_>, SignalProtocolError>>()?;
+    protocol_store
+        .save_kyber_pre_keys(&records)
+        .instrument(tracing::trace_span!(parent: &span, "save kyber pre keys"))
+        .await?;
+    // TODO: Shouldn't this also remove the previous pre-keys from storage?
+    //       I think we might want to update the storage, and then sync the storage to the
+    //       server.
 
     // Generate and store the next signed prekey
     let signed_pre_key_pair = KeyPair::generate(csprng);
@@ -305,4 +336,256 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
         pq_pre_keys,
         pq_last_resort_key,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libsignal_protocol::{
+        Direction, IdentityChange, InMemKyberPreKeyStore, InMemPreKeyStore,
+        ProtocolAddress, PublicKey,
+    };
+
+    // Only the pre key halves work; the rest is required by the trait bounds.
+    #[derive(Default)]
+    struct TestStore {
+        pre_keys: InMemPreKeyStore,
+        kyber_pre_keys: InMemKyberPreKeyStore,
+    }
+
+    #[async_trait(?Send)]
+    impl PreKeyStore for TestStore {
+        async fn get_pre_key(
+            &self,
+            id: PreKeyId,
+        ) -> Result<PreKeyRecord, SignalProtocolError> {
+            self.pre_keys.get_pre_key(id).await
+        }
+
+        async fn save_pre_key(
+            &mut self,
+            id: PreKeyId,
+            record: &PreKeyRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.pre_keys.save_pre_key(id, record).await
+        }
+
+        async fn remove_pre_key(
+            &mut self,
+            id: PreKeyId,
+        ) -> Result<(), SignalProtocolError> {
+            self.pre_keys.remove_pre_key(id).await
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl KyberPreKeyStore for TestStore {
+        async fn get_kyber_pre_key(
+            &self,
+            id: KyberPreKeyId,
+        ) -> Result<KyberPreKeyRecord, SignalProtocolError> {
+            self.kyber_pre_keys.get_kyber_pre_key(id).await
+        }
+
+        async fn save_kyber_pre_key(
+            &mut self,
+            id: KyberPreKeyId,
+            record: &KyberPreKeyRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.kyber_pre_keys.save_kyber_pre_key(id, record).await
+        }
+
+        async fn mark_kyber_pre_key_used(
+            &mut self,
+            _id: KyberPreKeyId,
+            _ec_id: SignedPreKeyId,
+            _base_key: &PublicKey,
+        ) -> Result<(), SignalProtocolError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SignedPreKeyStore for TestStore {
+        async fn get_signed_pre_key(
+            &self,
+            _id: SignedPreKeyId,
+        ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn save_signed_pre_key(
+            &mut self,
+            _id: SignedPreKeyId,
+            _record: &SignedPreKeyRecord,
+        ) -> Result<(), SignalProtocolError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IdentityKeyStore for TestStore {
+        async fn get_identity_key_pair(
+            &self,
+        ) -> Result<IdentityKeyPair, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn get_local_registration_id(
+            &self,
+        ) -> Result<u32, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn save_identity(
+            &mut self,
+            _address: &ProtocolAddress,
+            _identity: &IdentityKey,
+        ) -> Result<IdentityChange, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn is_trusted_identity(
+            &self,
+            _address: &ProtocolAddress,
+            _identity: &IdentityKey,
+            _direction: Direction,
+        ) -> Result<bool, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn get_identity(
+            &self,
+            _address: &ProtocolAddress,
+        ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl KyberPreKeyStoreExt for TestStore {
+        async fn store_last_resort_kyber_pre_key(
+            &mut self,
+            _id: KyberPreKeyId,
+            _record: &KyberPreKeyRecord,
+        ) -> Result<(), SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn load_last_resort_kyber_pre_keys(
+            &self,
+        ) -> Result<Vec<KyberPreKeyRecord>, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn remove_kyber_pre_key(
+            &mut self,
+            _id: KyberPreKeyId,
+        ) -> Result<(), SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn mark_all_one_time_kyber_pre_keys_stale_if_necessary(
+            &mut self,
+            _stale_time: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn delete_all_stale_one_time_kyber_pre_keys(
+            &mut self,
+            _threshold: chrono::DateTime<chrono::Utc>,
+            _min_count: usize,
+        ) -> Result<(), SignalProtocolError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl PreKeysStore for TestStore {
+        async fn next_pre_key_id(&self) -> Result<u32, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn next_signed_pre_key_id(
+            &self,
+        ) -> Result<u32, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn next_pq_pre_key_id(&self) -> Result<u32, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn signed_pre_keys_count(
+            &self,
+        ) -> Result<usize, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn kyber_pre_keys_count(
+            &self,
+            _last_resort: bool,
+        ) -> Result<usize, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn signed_prekey_id(
+            &self,
+        ) -> Result<Option<SignedPreKeyId>, SignalProtocolError> {
+            unimplemented!()
+        }
+
+        async fn last_resort_kyber_prekey_id(
+            &self,
+        ) -> Result<Option<KyberPreKeyId>, SignalProtocolError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_batch_saves_store_every_record() {
+        let mut rng = rand::rng();
+        let identity = IdentityKeyPair::generate(&mut rng);
+        let mut store = TestStore::default();
+
+        let pre_keys: Vec<_> = (1..=5u32)
+            .map(|i| {
+                let id = PreKeyId::from(i);
+                (id, PreKeyRecord::new(id, &KeyPair::generate(&mut rng)))
+            })
+            .collect();
+        let kyber_pre_keys: Vec<_> = (1..=5u32)
+            .map(|i| {
+                let id = KyberPreKeyId::from(i);
+                let record = KyberPreKeyRecord::generate(
+                    kem::KeyType::Kyber1024,
+                    id,
+                    identity.private_key(),
+                )
+                .unwrap();
+                (id, record)
+            })
+            .collect();
+
+        store.save_pre_keys(&[]).await.unwrap();
+        store.save_kyber_pre_keys(&[]).await.unwrap();
+        store.save_pre_keys(&pre_keys).await.unwrap();
+        store.save_kyber_pre_keys(&kyber_pre_keys).await.unwrap();
+
+        for (id, record) in &pre_keys {
+            let stored = store.get_pre_key(*id).await.unwrap();
+            assert_eq!(
+                stored.serialize().unwrap(),
+                record.serialize().unwrap()
+            );
+        }
+        for (id, record) in &kyber_pre_keys {
+            let stored = store.get_kyber_pre_key(*id).await.unwrap();
+            assert_eq!(
+                stored.serialize().unwrap(),
+                record.serialize().unwrap()
+            );
+        }
+    }
 }
