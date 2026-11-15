@@ -19,6 +19,10 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # clippy-check reports through check runs.
+    permissions:
+      contents: read
+      checks: write
     strategy:
       fail-fast: false
     steps:
