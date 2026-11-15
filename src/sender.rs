@@ -681,7 +681,12 @@ where
                             "creating session with missing device {}",
                             missing_device_id
                         );
-                        let remote_address = get_preferred_protocol_address(&self.protocol_store, &recipient, *missing_device_id).await?;
+                        let remote_address = get_preferred_protocol_address(
+                            &self.protocol_store,
+                            &recipient,
+                            *missing_device_id,
+                        )
+                        .await?;
                         let pre_key = self
                             .identified_ws
                             .get_pre_key(&recipient, *missing_device_id)
@@ -715,10 +720,21 @@ where
                             "refreshing session with device {}",
                             stale_device_id
                         );
-                        let remote_address = get_preferred_protocol_address(&self.protocol_store, &recipient, *stale_device_id).await?;
-                        if let Some(mut session) = self.protocol_store.load_session(&remote_address).await? {
+                        let remote_address = get_preferred_protocol_address(
+                            &self.protocol_store,
+                            &recipient,
+                            *stale_device_id,
+                        )
+                        .await?;
+                        if let Some(mut session) = self
+                            .protocol_store
+                            .load_session(&remote_address)
+                            .await?
+                        {
                             session.archive_current_state()?;
-                            self.protocol_store.store_session(&remote_address, &session).await?;
+                            self.protocol_store
+                                .store_session(&remote_address, &session)
+                                .await?;
                         }
 
                         let pre_key = self
@@ -1073,8 +1089,7 @@ where
             ).unwrap_or(false),
             None => false,
         };
-        if !has_usable_session
-        {
+        if !has_usable_session {
             info!(
                 "establishing new session with {}",
                 recipient_protocol_address
